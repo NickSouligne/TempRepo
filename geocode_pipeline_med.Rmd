@@ -1,0 +1,417 @@
+---
+title: "TRACKPCC Geocoding pipeline"
+output: html_notebook
+Author: Nick Souligne (nasouligne@arizona.edu)
+---
+
+ 
+Step 1: Set up the environment
+This pipeline is a test bed for working on MED data 
+```{r}
+library(tidyverse)
+library(dplyr)
+library(purrr)
+library(tidygeocoder)
+library("boxrdrive")
+
+load(file = box_drive(
+                     "(UA Box Health) Peds Research Datasets", 
+                     "(UA Box Health) TrackPCC", "Dev", "01_SourceData", "Y2Q4_Part2", 
+                     "MEDC.RData"))
+data <- MED
+
+rm(MED)
+
+```
+
+
+
+
+
+Step 2: Clean the data
+```{r}
+
+#Store records with missing addresses
+missing_address <- data[ 
+  (is.na(data$str_1) | data$str_1 == "") & 
+  (is.na(data$str_2) | data$str_2 == "") 
+, ]
+
+#Remove records with missing addresses from data
+data <- data[ 
+  !((is.na(data$str_1) | data$str_1 == "") & 
+    (is.na(data$str_2) | data$str_2 == "")) 
+, ]
+
+
+#Create a new dataframe with only the relevant information
+records_to_geocode <- data %>% 
+  select(str_1, rcp_st, rcp_zip) %>%
+  mutate(zip = case_when(rcp_zip == "NULL" ~ NA,
+                         rcp_zip == "<NONE>" ~ NA,
+                       .default = rcp_zip),
+         street = case_when(str_detect(str_1, "RETURN")|
+                             str_detect(str_1, "WRONG")|
+                             str_detect(str_1, "ADDRESS")|
+                             str_detect(str_1, "DO NOT USE")|
+                             str_detect(str_1, "NEED")| 
+                             str_detect(str_1, "NONE")|
+                             str_detect(str_1, "INQU")|
+                             str_detect(str_1, "UNKNOWN")|
+                             str_detect(str_1, "UPDATE")|
+                             str_detect(str_1, "NULL") ~ NA, 
+                    .default = str_1),
+         state = case_when(str_detect(rcp_st, "NULL") ~ NA,  
+                    .default = rcp_st),
+         state = str_trunc(state, width = 2, side = "right", ellipsis = ""))
+
+
+#Some of the encoding was off so this ensures everything is encoded uniformly
+records_to_geocode$street <- iconv(records_to_geocode$street, from = "latin1", to = "UTF-8")
+records_to_geocode$state <- iconv(records_to_geocode$state, from = "latin1", to = "UTF-8")
+
+
+
+```
+
+
+
+
+Step 3: Split data into batches and pass into geocoder
+```{r}
+#Define a batch size, census limits to 10k requests at a time
+batch_size <- 10000
+
+#Split the data into batches with max size of 10000
+batches <- split(records_to_geocode, ceiling(seq_len(nrow(records_to_geocode)) / batch_size))
+
+#Run the first batch to capture the structure of `result`, this will make appending new records much simpler
+#For MED data the fields are incomplete so we call the API without the method = 'census' to get approximated location data
+#This approximated location data can then be parsed out and fed back into the API with the method = 'census' to get full geocoded data
+batch_to_geocode = batches[[1]]
+result = batch_to_geocode %>% 
+         geocode(
+           street = street,
+           state = state,
+           postalcode = zip,
+           full_results = TRUE,
+           verbose = TRUE,
+           api_options = list(census_return_type = 'geographies')
+       )
+
+#Initialize GEO_IND based on the structure of `result`. GEO_IND will eventually contain all of the geocoded locations
+GEO_IND <- result[0, ]  
+
+#Add the first result to GEO_IND
+GEO_IND <- rbind(GEO_IND, result)
+
+
+#Create empty vector to hold indices that don't geocode correctly
+failed_batches <- c()
+
+#Process the remaining batches in the loop. i will start at 2 as first batch has already been processed
+for(i in 2:length(batches)){
+  print("Starting batch processing on batch ") #Print statements added for debugging
+  print(i)
+  batch_to_geocode = batches[[i]]
+  result = batch_to_geocode %>% 
+          geocode(
+            street = street,
+            state = state,
+            postalcode = zip,
+            full_results = TRUE,
+            verbose = TRUE,
+            api_options = list(census_return_type = 'geographies')
+        )
+  
+  print(result)
+  
+  tryCatch({
+      #Append result to GEO_IND
+      GEO_IND <- rbind(GEO_IND, result)
+      print("Results appended")
+  },
+  error=function(e){
+    print("Error returned for batch")
+    print(i)
+    failed_batches <- append(failed_batches, i)
+  }
+  )
+
+}
+
+
+
+```
+
+
+
+```{r}
+#With GEO_IND containing the full approximated location data we can clean it up to pass it back into the API
+
+#This function will extract the specific components of the display_name field returned by the API 
+extract_address_components <- function(display_name) {
+  # Street Address: Up to the 3rd comma
+  street_regex <- "^(.*?,.*?,.*?),"
+  
+  # City: Between the 3rd and 4th commas
+  city_regex <- "^[^,]*,[^,]*,[^,]*,\\s*([^,]+),"
+  
+  # State: Between the 5th and 6th commas
+  state_regex <- "(?:,[^,]+){4},\\s*([^,]+),"
+  
+  # ZIP: 5-digit number before the last component
+  zip_regex <- "\\b(\\d{5})\\b"
+  
+  # Extract components using the updated regex
+  street <- str_extract(display_name, street_regex) %>% str_remove(",$") %>% str_trim()
+  city <- str_extract(display_name, city_regex) %>% str_trim()
+  state <- str_extract(display_name, state_regex) %>% str_trim()
+  zip <- str_extract(display_name, zip_regex) %>% str_trim()
+  
+  return(list(street = street, city = city, state = state, zip = zip))
+}
+
+
+GEO_IND <- GEO_IND %>%
+  mutate(
+    address_components = map(display_name, extract_address_components),
+    street = map_chr(address_components, "street"),
+    city = map_chr(address_components, "city"),
+    state = map_chr(address_components, "state"),
+    zip = map_chr(address_components, "zip")
+  ) %>%
+  select(-address_components) # Remove the intermediate list column if not needed
+
+
+
+#Split the data into batches with max size of 10000
+batches <- split(GEO_IND, ceiling(seq_len(nrow(GEO_IND)) / batch_size))
+
+#Run the first batch to capture the structure of `result`, this will make appending new records much simpler
+batch_to_geocode = batches[[1]]
+result = batch_to_geocode %>% 
+         geocode(
+           street = street,
+           state = state,
+           postalcode = zip,
+           method = 'census',
+           full_results = TRUE,
+           verbose = TRUE,
+           api_options = list(census_return_type = 'geographies')
+       )
+
+#Initialize GEO_IND based on the structure of `result`. GEO_IND will eventually contain all of the geocoded locations
+GEO_IND_clean <- result[0, ]  
+
+#Add the first result to GEO_IND
+GEO_IND_clean <- rbind(GEO_IND_clean, result)
+
+
+#Create empty vector to hold indices that don't geocode correctly
+failed_batches <- c()
+
+#Process the remaining batches in the loop. i will start at 2 as first batch has already been processed
+for(i in 2:length(batches)){
+  print("Starting batch processing on batch ") #Print statements added for debugging
+  print(i)
+  batch_to_geocode = batches[[i]]
+  result = batch_to_geocode %>% 
+          geocode(
+            street = street,
+            city = city,
+            state = state,
+            postalcode = zip,
+            method = 'census',
+            full_results = TRUE,
+            verbose = TRUE,
+            api_options = list(census_return_type = 'geographies')
+        )
+  
+  print(result)
+  
+  tryCatch({
+      #Append result to GEO_IND
+      GEO_IND_clean <- rbind(GEO_IND_clean, result)
+      print("Results appended")
+  },
+  error=function(e){
+    print("Error returned for batch")
+    print(i)
+    failed_batches <- append(failed_batches, i)
+  }
+  )
+
+}
+
+```
+
+
+
+
+
+
+Step 4: Reformat the geocoded data to modified OMOP 
+```{r}
+#Record the rows that were not matched
+non_matched_rows <- GEO_IND_clean %>% filter(GEO_IND_clean$match_indicator == 'No_Match')
+
+#Function to parse the matched locations for address, city, state, and zip
+parse_location <- function(location) {
+  parsed <- str_match(location, "^(.*),\\s*(.*),\\s*([A-Z]{2}),\\s*(\\d{5})$")
+  data.frame(
+    address_parsed = parsed[, 2],
+    city_parsed = parsed[, 3],
+    state_parsed = parsed[, 4],
+    zip_parsed = parsed[, 5],
+    stringsAsFactors = FALSE
+  )
+}
+
+
+
+#Pull the matched locations and parse out the relevant fields
+GEO_IND_matched <- GEO_IND_clean %>%
+  rowwise() %>%
+  mutate(parsed = list(parse_location(matched_address))) %>%
+  unnest_wider(parsed)
+
+
+
+
+#Identify and store duplicates in a new dataframe
+duplicate_columns <- c("address_parsed", "city_parsed", "state_parsed", "zip_parsed")
+duplicates <- GEO_IND_matched %>%
+  group_by(across(all_of(duplicate_columns))) %>% 
+  filter(n() > 1) %>% 
+  ungroup()
+
+
+#Reformat the data and drop unnecessary columns
+OMOP_data <- GEO_IND_matched %>%
+  filter(match_indicator != 'No_Match') %>%
+  select(address_parsed, city_parsed, state_parsed, zip_parsed, county_fips, state_fips, lat, long, input_address, 
+         tiger_line_id, tiger_side, match_type) %>%
+  rename(address_1 = address_parsed, 
+         location_source_value = input_address, 
+         latitude = lat, 
+         longitude = long, 
+         city = city_parsed, 
+         state = state_parsed, 
+         zip = zip_parsed) %>%
+  distinct(address_1, city, state, zip, .keep_all = TRUE) %>%
+  mutate(location_id = row_number()) %>%
+  mutate(country = 'US')
+
+
+#Reorder the columns in the dataframe
+ordered_cols <- c('location_id', 'address_1', 'city', 'state', 'zip', 'county_fips', 'state_fips', 'location_source_value', 'country',
+                  'latitude','longitude', 'tiger_line_id', 'tiger_side', 'match_type')
+OMOP_data <- OMOP_data[, ordered_cols]
+
+
+```
+
+
+
+
+
+Step 5: Write the results to the CSV
+```{r}
+
+#Sample CSV file path
+csv_file_path <- "TRACKPCC_Geocoded_locations.csv"
+
+#Load existing CSV data
+if (file.exists(csv_file_path)) {
+  existing_data <- read.csv(csv_file_path, stringsAsFactors = FALSE)
+} else {
+  #Initialize an empty dataframe if the CSV does not exist
+  existing_data <- data.frame(address_1 = character(),
+                              city = character(),
+                              state = character(),
+                              zip = character(),
+                              location_id = numeric(),
+                              stringsAsFactors = FALSE)
+}
+
+existing_data$zip <- as.character(as.numeric(existing_data$zip))
+existing_data$county_fips <- as.character(as.numeric(existing_data$county_fips))
+existing_data$state_fips <- as.character(as.numeric(existing_data$state_fips))
+existing_data$tiger_line_id <- as.character(as.numeric(existing_data$tiger_line_id))
+#Check for duplicates between existing CSV and newly processed records
+deduplicated_data <- anti_join(
+  OMOP_data, 
+  existing_data, 
+  by = c("address_1", "city", "state", "zip")
+)
+
+
+#Assign location_id
+last_location_id <- ifelse(nrow(existing_data) > 0, max(existing_data$location_id, na.rm = TRUE), 0)
+deduplicated_data <- deduplicated_data %>%
+  mutate(location_id = seq(last_location_id + 1, length.out = n()))
+
+
+# Append deduplicated data to the existing CSV data
+updated_data <- bind_rows(existing_data, deduplicated_data)
+
+# Save the updated data back to the CSV file
+write.csv(updated_data, csv_file_path, row.names = FALSE)
+
+# Display results
+cat("Updated CSV file written to:", csv_file_path, "\n")
+cat("Number of new records added:", nrow(deduplicated_data), "\n")
+
+
+
+#Sample CSV file path
+csv_file_path2 <- "TRACKPCC_Geocoded_locations_missing.csv"
+
+#Load existing CSV data for missing records
+if (file.exists(csv_file_path2)) {
+  missing_existing_data <- read.csv(csv_file_path2, stringsAsFactors = FALSE)
+} else {
+  #Initialize an empty dataframe if the CSV does not exist
+  missing_existing_data <- data.frame(address_1 = character(),
+                              city = character(),
+                              state = character(),
+                              zip = character(),
+                              location_id = numeric(),
+                              stringsAsFactors = FALSE)
+}
+
+
+# Append deduplicated data to the existing CSV data
+updated_missing_data <- bind_rows(missing_existing_data, missing_address)
+
+# Save the updated data back to the CSV file
+write.csv(updated_missing_data, csv_file_path2, row.names = FALSE)
+
+
+```
+
+
+
+
+```{r}
+### Testing census api remove before prod
+
+
+# Create a dataframe for input
+address_df <- data.frame(
+  street = "15924 W PARADISE LN",
+  state = "AZ",
+  stringsAsFactors = FALSE
+)
+
+# Pass the dataframe to geocode
+result <- geocode(address_df, street = street, state = state, verbose = TRUE, full_results = TRUE, api_options = list(census_return_type = 'geographies'))
+print(result)
+
+```
+
+
+
+
+
